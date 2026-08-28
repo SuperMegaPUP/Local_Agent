@@ -1,0 +1,21 @@
+[Unit]
+Description=Agent conveyor gateway (Gorizont Sobytij)
+After=network-online.target
+
+[Service]
+Type=simple
+User=g
+WorkingDirectory=/home/g/gorizont-sobytij_test
+Environment=PIPELINE_HOME=/home/g/agent-pipeline
+Environment=PIPELINE_PROJECT_DIR=/home/g/gorizont-sobytij_test
+Environment=PIPELINE_MAX_PARALLEL=4
+Environment=PIPELINE_MODEL=vllm/qwen3.8-27b
+Environment=PATH=/home/g/.opencode/bin:/home/g/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /home/g/agent-pipeline/gateway/gateway.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/g/agent-pipeline/gateway.log
+StandardError=append:/home/g/agent-pipeline/gateway.log
+
+[Install]
+WantedBy=multi-user.target

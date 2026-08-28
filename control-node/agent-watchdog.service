@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent pipeline LLM-engine watchdog (client to GPU-node agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=g
+Environment=WATCHDOG_AGENT_URL=__AGENT_URL__
+Environment=WATCHDOG_TOKEN=__TOKEN__
+Environment=PIPELINE_DB=/home/g/agent-pipeline/kanban/boards/main.sqlite3
+Environment=POLL_SEC=15
+Environment=STUCK_WINDOW_SEC=120
+Environment=HANG_COOLDOWN_SEC=60
+Environment=RESTART_AFTER_HANGS=2
+Environment=RESTART_COOLDOWN_SEC=180
+ExecStart=/usr/bin/python3 /home/g/agent-pipeline/gateway/watchdog.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/g/agent-pipeline/watchdog.log
+StandardError=append:/home/g/agent-pipeline/watchdog.log
+
+[Install]
+WantedBy=multi-user.target
