@@ -229,6 +229,77 @@ check("metrics cycle-time", "avg cycle time" in out and "1.5h" in out, out[out.f
 check("metrics escalations", "created=1 resolved=1" in out, out[out.find("[ESC"):out.find("[ESC")+60])
 check("metrics death-reasons", "crash(dead)" in out, out[out.find("[DEATH"):out.find("[DEATH")+150])
 
+# ================= cli: lesson filters (Q3, ревизия 2026-08-28) =================
+LC = cl.lesson_check
+GOOD_LESSONS = [
+    "When importing types from .d.ts, check tsconfig paths mapping first.",
+    "Когда npm install падает на ERESOLVE, проверь peer-deps в package.json перед retry.",
+    "When validateToken() throws TS2304, the route handler signature drifted — align params.",
+    "When exit code 137 appears in runs, raise timeout_minutes for heavy jest suites.",
+]
+BAD_LESSONS = [
+    ("Be more careful with type imports.", "стоп"),
+    ("When fixing routes, be careful with types.", "стоп"),
+    ("When something breaks, double-check everything.", "стоп"),
+    ("Всегда будь внимательнее с типами.", "формат"),
+    ("When fixing auth, remember to rotate keys.", "стоп"),
+    ("Fix the login bug properly.", "формат"),
+    ("When the build fails, investigate the root cause thoroughly.", "конкретика"),
+    ("When TS2304 appears, check src/routes.ts. Never deploy on weekends.", "always"),
+]
+for lt in GOOD_LESSONS:
+    ok, why = LC(lt)
+    check("lesson-good [%s]" % lt[:28], ok, why)
+for lt, tag in BAD_LESSONS:
+    ok, why = LC(lt)
+    check("lesson-bad[%s] [%s]" % (tag, lt[:24]), not ok, "should reject: " + why)
+ok, why = LC("NO_LESSON")
+check("lesson-noop-sentinel", ok and why == "noop", why)
+ok, why = LC("")
+check("lesson-empty-noop", ok and why == "noop", why)
+# cmd_mem интеграция: reject -> exit 1, noop -> тихо, good -> запись
+import types as _t
+arg_good = _t.SimpleNamespace(kind="lesson", content=GOOD_LESSONS[0], project=None, tags=None)
+buf = io.StringIO()
+with redirect_stdout(buf):
+    cl.cmd_mem(arg_good)
+n_mem = cc2 = sqlite3.connect(cli_db)
+cnt = n_mem.execute("SELECT COUNT(*) n FROM memories WHERE kind='lesson'").fetchone()[0]
+n_mem.close()
+check("lesson-integration-save", cnt == 1 and "OK memory" in buf.getvalue(), buf.getvalue())
+arg_bad = _t.SimpleNamespace(kind="lesson", content=BAD_LESSONS[0][0], project=None, tags=None)
+try:
+    with redirect_stdout(io.StringIO()):
+        cl.cmd_mem(arg_bad)
+    check("lesson-integration-reject", False, "no exit raised")
+except SystemExit as e:
+    check("lesson-integration-reject", e.code == 1, str(e.code))
+arg_noop = _t.SimpleNamespace(kind="lesson", content="NO_LESSON", project=None, tags=None)
+buf2 = io.StringIO()
+with redirect_stdout(buf2):
+    cl.cmd_mem(arg_noop)
+cnt2 = sqlite3.connect(cli_db).execute("SELECT COUNT(*) n FROM memories WHERE kind='lesson'").fetchone()[0]
+check("lesson-integration-noop-notsaved", cnt2 == 1 and "noop" in buf2.getvalue(), buf2.getvalue())
+
+# ================= cli: overhead metrics (Q5, ревизия 2026-08-28) =================
+co = sqlite3.connect(cli_db)
+co.execute("INSERT INTO runs(card_id,attempt,command,exit_code,output,started_at,finished_at) "
+           "VALUES('m1',1,'mechanical-gates',0,'ok','2026-08-28 08:30:00','2026-08-28 08:31:00')")
+co.execute("INSERT INTO runs(card_id,attempt,command,exit_code,output,started_at,finished_at) "
+           "VALUES('m2',1,'mechanical-gates',0,'ok','2026-08-28 09:00:00','2026-08-28 09:02:00')")
+co.execute("INSERT INTO runs(card_id,attempt,command,exit_code,output,started_at,finished_at) "
+           "VALUES('m1',1,'consult-light-gate',0,'ok','2026-08-28 08:30:00','2026-08-28 08:30:00')")
+co.commit(); co.close()
+buf3 = io.StringIO()
+with redirect_stdout(buf3):
+    cl.cmd_metrics(type("A", (), {})())
+out3 = buf3.getvalue()
+check("metrics-overhead-section", "[OVERHEAD" in out3, out3[-300:])
+check("metrics-overhead-total", "180.0s" in out3, out3[out3.find("[OVERHEAD"):][:200])
+check("metrics-overhead-percard", "per-card overhead: 1.00 min" in out3, out3[out3.find("per-card"):][:80])
+# 1.0 min / 90 min avg cycle = 1.11% (denominator = 3 done incl. escalation)
+check("metrics-overhead-pct", "(1.11% of avg cycle)" in out3, out3[out3.find("per-card"):][:80])
+
 # ================= ИТОГ =================
 print("\n" + "=" * 50)
 print("TOTAL: %d passed, %d failed" % (len(PASSED), len(FAILED)))

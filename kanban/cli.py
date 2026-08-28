@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Kanban CLI — единая точка правды конвейера Горизонт Событий. Stdlib only."""
-import argparse, os, sqlite3, sys, uuid
+import argparse, os, re, sqlite3, sys, uuid
 from datetime import datetime, timezone
 
 BASE = os.path.expanduser(os.environ.get("PIPELINE_HOME", "~/agent-pipeline"))
@@ -162,11 +162,64 @@ def cmd_comment(a):
 
 
 def cmd_mem(a):
+    if a.kind == "lesson":
+        ok, reason = lesson_check(a.content)
+        if reason == "noop":
+            print("OK noop (NO_LESSON — урок осознанно не сохраняем)")
+            return
+        if not ok:
+            print("LESSON REJECTED: " + reason)
+            sys.exit(1)
     c = con()
     c.execute("INSERT INTO memories(kind,content,project,tags,created_at) VALUES(?,?,?,?,?)",
               (a.kind, a.content, a.project or "horizon", a.tags or "", now()))
     c.commit(); c.close()
     print("OK memory")
+
+
+# ---------- REVIZIA 2026-08-28 Q3: 4-уровневый фильтр авто-уроков (0 LLM) ----------
+# Уровень 0: NO_LESSON sentinel — осознанно пустой урок (не ошибка).
+# Уровень 1: конкретная ссылка — файл/функция/код ошибки. Без неё урок «про всё».
+# Уровень 2: стоп-фразы — маркеры бесполезного совета.
+# Уровень 3: структурный формат «When <condition>, <action>» / «Когда ..., ...».
+LESSON_REF_RE = re.compile(
+    r"[\w.$-]+/[\w.$/-]+\.[A-Za-z]{2,}"          # путь к файлу: src/auth/token.ts
+    r"|\b[a-zA-Z_]\w{2,}\s*\("                   # вызов функции: validateToken(
+    r"|\b(?:TS\d{4}|E[A-Z0-9]{3,}|exit code \d+|errno \d+)\b"  # код ошибки: TS2304, ERESOLVE
+    r"|\b[\w.$-]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|json|ya?ml|md|css|scss|less|sql|sh|bash|"
+    r"toml|ini|cfg|vue|svelte|rb|go|rs|java|kt|c|h|cpp|hpp|proto|graphql|gql|wasm|env|"
+    r"tf|hcl|lock|mod|gradle|xml|xsd|csv|parquet|pb|dart|zig|nim|lua|pl|php|cs|scala|sol)\b"
+                                                  # имя файла: .d.ts, package.json
+)
+LESSON_STOP_PHRASES = (
+    "be careful", "pay attention", "double-check", "be thorough",
+    "remember to", "make sure", "don't forget", "dont forget",
+    "внимательнее", "аккуратнее", "проверяй", "будь осторожн",
+)
+LESSON_PREFIXES = ("when ", "когда ")
+
+
+def lesson_check(content):
+    """Возвращает (True, '') | (True, 'noop') | (False, причина)."""
+    txt = (content or "").strip()
+    if not txt or txt.upper() == "NO_LESSON":
+        return True, "noop"
+    low = txt.lower()
+    if not low.startswith(LESSON_PREFIXES):
+        return False, ("формат: урок начинается с 'When <условие>, <действие>' "
+                       "или 'Когда <условие>, <действие>'")
+    if "," not in txt:
+        return False, "формат: нет запятой, разделяющей условие и действие"
+    if not LESSON_REF_RE.search(txt):
+        return False, ("конкретика: нужна хотя бы одна ссылка — путь к файлу, "
+                       "имя функции или код ошибки (TS####/E???)")
+    for ph in LESSON_STOP_PHRASES:
+        if ph in low:
+            return False, "стоп-фраза: '%s'" % ph
+    for sent in re.split(r"[.!?\n]", low):
+        if re.search(r"\b(always|never)\b", sent) and not LESSON_REF_RE.search(sent):
+            return False, "always/never без конкретного контекста в предложении"
+    return True, ""
 
 
 def cmd_recall(a):
@@ -249,6 +302,22 @@ def cmd_metrics(a):
     # Retries per card histogram.
     retried = c.execute("SELECT COUNT(*) n FROM cards WHERE retry_count>0 AND kind!='epic'").fetchone()["n"]
 
+    # REVIZIA 2026-08-28 Q5: per-card overhead — измеренная стоимость слоёв.
+    # Данные: runs.started_at/finished_at (до ревизии писалось now()/now() = 0.0s,
+    # overhead было не измерить). Главный прокси «стоимости сложности» из ответа
+    # облачной модели: overhead мин/card и доля от среднего цикла.
+    ov_rows = c.execute("""
+        SELECT command,
+               SUM((julianday(finished_at)-julianday(started_at))*86400) AS s,
+               COUNT(*) AS n
+        FROM runs
+        WHERE finished_at IS NOT NULL AND finished_at <> ''
+          AND julianday(finished_at) >= julianday(started_at)
+        GROUP BY command""").fetchall()
+    ov_total_min = sum((r["s"] or 0) for r in ov_rows) / 60.0
+    ov_per_card = ov_total_min / total_done if total_done else 0.0
+    ov_pct = (ov_per_card / (avg_hours * 60.0) * 100.0) if avg_hours else 0.0
+
     print("=" * 62)
     print("METRICS (аудит 2026-08-28, итерация 6) — %s" % now())
     print("=" * 62)
@@ -270,6 +339,14 @@ def cmd_metrics(a):
             print("  %-22s %d" % (k, v))
     else:
         print("  (нет)")
+    print("[OVERHEAD (Q5: стоимость слоёв)]")
+    if ov_rows:
+        for r in ov_rows:
+            print("  %-22s n=%-4d total=%7.1fs  avg=%6.1fs/run"
+                  % (r["command"], r["n"], r["s"] or 0, (r["s"] or 0) / r["n"]))
+        print("  per-card overhead: %.2f min  (%.2f%% of avg cycle)" % (ov_per_card, ov_pct))
+    else:
+        print("  (нет замеров — тайминги пишутся с ревизии 2026-08-28)")
     c.close()
 
 

@@ -492,7 +492,14 @@ def _capture_current_gate_states():
     """Снимает текущее состояние гейтов. Возвращает (tsc_set, lint_set, jest_failed_suites)."""
     tsc_set, lint_set, jest_failed = set(), set(), set()
     try:
-        r = subprocess.run(["npx", "tsc", "--noEmit"], cwd=PROJECT_DIR, capture_output=True, text=True, timeout=1800)
+        # REVIZIA 2026-08-28 Q2: --incremental кэш type-info между прогонами.
+        # Измерено на боевом проекте (tsc 5.9.3): cold 15.1s -> warm 4.7s (3.2x).
+        # tsbuildinfo живёт рядом с baseline-файлами; при revert/checkout tsc сам
+        # пересобирает изменившиеся файлы (hash+mtime контроль), ложных PASS нет.
+        incr_args = ["--incremental", "--tsBuildInfoFile",
+                     os.path.join(_gate_baseline_dir(), ".tsbuildinfo")]
+        r = subprocess.run(["npx", "tsc", "--noEmit"] + incr_args,
+                           cwd=PROJECT_DIR, capture_output=True, text=True, timeout=1800)
         for ln in _both(r).splitlines():
             m = re.match(r"^([^(:]+)\((\d+),\d+\): error (TS\d+)", ln.strip())
             if m:
@@ -874,6 +881,10 @@ def iter_cycle(oneshot=False):
             if worktrees_enabled() and r["assignee"] in LOCK_ROLES:
                 cleanup_worktree(r["id"])
             continue
+        # REVIZIA 2026-08-28 Q5: честный тайминг гейтов (было now()/now() — 0.0s,
+        # overhead слоёв было не измерить). Данных для per-card overhead теперь
+        # хватает: runs.started_at/finished_at по механическим гейтам.
+        _gt0 = now()
         ok, report = run_gates(r)
         # SIMBIOSIS W3 (слой K): security_gate=1 — детерминированный скан
         # (gitleaks + npm audit, baseline-aware). Тумблер PIPELINE_SECURITY_SCAN.
@@ -884,7 +895,7 @@ def iter_cycle(oneshot=False):
                 ok = False
                 log(f"[sec] {r['id']}: security-скан FAIL")
         c.execute("INSERT INTO runs(card_id,attempt,command,exit_code,output,started_at,finished_at) VALUES(?,?,?,?,?,?,?)",
-                  (r["id"], 1, "mechanical-gates", 0 if ok else 1, report[:4000], now(), now()))
+                  (r["id"], 1, "mechanical-gates", 0 if ok else 1, report[:4000], _gt0, now()))
         if ok:
             c.execute("INSERT INTO comments(card_id,author,body,created_at) VALUES(?,?,?,?)",
                       (r["id"], "gateway", "ARTIFACTS: mechanical gates PASSED (tsc+eslint+jest)", now()))
