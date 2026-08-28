@@ -22,6 +22,12 @@ PROJECT_DIR = os.path.expanduser(os.environ.get("PIPELINE_PROJECT_DIR", "~/goriz
 OPENCODE = os.path.expanduser("~/.opencode/bin/opencode")
 MODEL = os.environ.get("PIPELINE_MODEL", "vllm/qwen3.8-27b")
 POLL_SEC = int(os.environ.get("PIPELINE_POLL_SEC", "90"))
+# Аудит 2026-08-28 (итерация 8): адаптивный поллинг — плотнее при активности,
+# реже в простое. ПАУЗА распознаётся не позже ADAPT_IDLE_SEC.
+ADAPT_POLL = os.environ.get("PIPELINE_ADAPT_POLL", "1") == "1"
+ADAPT_ACTIVE_SEC = int(os.environ.get("PIPELINE_POLL_ACTIVE", "30"))   # есть running
+ADAPT_READY_SEC = int(os.environ.get("PIPELINE_POLL_READY", "15"))    # есть ready
+ADAPT_IDLE_SEC = int(os.environ.get("PIPELINE_POLL_IDLE", "120"))     # доска пуста
 MAX_PARALLEL = int(os.environ.get("PIPELINE_MAX_PARALLEL", "4"))
 LOCK_ROLES = set(filter(None, os.environ.get("PIPELINE_REPO_LOCK_ROLES", "coder,qa").split(",")))
 HB_LIMIT_MIN = int(os.environ.get("PIPELINE_HEARTBEAT_MIN", "20"))
@@ -194,14 +200,92 @@ def detect_loop(cid):
         return None
 
 
-def inject_nudge_comment(c, cid, reason):
+def _latest_log_path(cid):
+    """Путь к самому свежему логу воркера (None, если нет)."""
+    try:
+        logs = [os.path.join(RUNDIR, f) for f in os.listdir(RUNDIR)
+                if f.startswith(cid + "-") and f.endswith(".log")]
+        if not logs:
+            return None
+        return max(logs, key=os.path.getmtime)
+    except Exception:
+        return None
+
+
+def extract_diag(cid, max_lines=6, max_chars=1200):
+    """Аудит 2026-08-28 (итерация 2): диагностичный экстракт из хвоста лога.
+    Берёт последние строки с маркерами ошибок (error/fail/exception/EACCES/ENOENT/
+    ERESOLVE/non-zero exit) — бесплатно (regex, 0 LLM). Пусто, если ошибок нет."""
+    path = _latest_log_path(cid)
+    if not path:
+        return ""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > LOOP_TAIL_BYTES:
+                fh.seek(size - LOOP_TAIL_BYTES)
+            data = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    pat = re.compile(r"(error|failed|failure|exception|eresolve|enoent|eacces|"
+                     r"cannot find module|syntaxerror|typeerror|referenceerror|"
+                     r"segfault|core dumped|panic|nonzero|exit code [1-9])", re.I)
+    errs = []
+    for ln in data.splitlines():
+        s = ln.strip()
+        if not s or len(s) < 8:
+            continue
+        if pat.search(s):
+            errs.append(s[:300])
+    if not errs:
+        return ""
+    return "\n".join(errs[-max_lines:])[:max_chars]
+
+
+INSTALL_CMD_RE = re.compile(
+    r"(?:^\$\s*yarn\s*$"
+    r"|^\$\s*(?:cd\s+\S+\s*(?:&&\s*)?)?(?:npm\s+(?:install|add|ci|i\b)"
+    r"|yarn\s+(?:add|install)\b|pnpm\s+(?:add|install)\b|bun\s+add\b))"
+    r"(?!.*--dry-run)", re.M)
+
+
+def detect_install_violation(cid):
+    """Аудит 2026-08-28 (итерация 7, вариант B): перехват npm/yarn/pnpm install
+    в логе worktree-воркера. node_modules — symlink на центральный, install
+    ломает ВСЕХ остальных воркеров. Возвращает команду-нарушитель или None.
+    Механическая защита вместо «промпт-просьбы» (принцип P2)."""
+    path = _latest_log_path(cid)
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > LOOP_TAIL_BYTES:
+                fh.seek(size - LOOP_TAIL_BYTES)
+            data = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    m = INSTALL_CMD_RE.search(data)
+    return m.group(0).strip()[:200] if m else None
+
+
+def inject_nudge_comment(c, cid, reason, diag=""):
     """Слой E: комментарий-пинок на карточке — воркер прочитает его при перезапуске
-    (протокол требует начинать с чтения карточки)."""
+    (протокол требует начинать с чтения карточки).
+    Аудит 2026-08-28 (итерация 2): diag — извлечённые из лога последние ошибки;
+    превращает абстрактный «смени подход» в конкретную целевую установку."""
     body = (f"NUDGE (gateway): предыдущая попытка завершилась: {reason}.\n"
             "Смени подход — НЕ повторяй ту же последовательность действий. "
             "Упрости шаг, изолируй проблему, проверяй инкрементально.\n"
             "Протокол: комментарий ARTIFACTS + move --status review. "
             "Не решаешь — move --status blocked с причиной.")
+    if "INSTALL-VIOLATION" in reason:
+        body += ("\nВажно: установка пакетов (npm install/yarn add/pnpm add) в worktree "
+                 "ЗАПРЕЩЕНА — node_modules общий (symlink), ты сломаешь других воркеров. "
+                 "Новая зависимость = отдельная карточка, а не самостоятельный install.\n")
+    if diag:
+        body += ("\nДИАГНОСТИКА (последние ошибки из лога — начни с их устранения):\n"
+                 + diag + "\n")
     c.execute("INSERT INTO comments(card_id,author,body,created_at) VALUES(?,?,?,?)",
               (cid, "gateway", body, now()))
 
@@ -690,8 +774,23 @@ def iter_cycle(oneshot=False):
             reason = "dead" if not alive else f"stuck>{HB_LIMIT_MIN}min"
             if loop_cmd:
                 reason += f"; LOOP: '{loop_cmd[:80]}'"
+            # Аудит 2026-08-28 (итерация 7, вар. B): перехват install в worktree.
+            # node_modules — symlink на центральный: install одного воркера ломает
+            # всех остальных. Kill + специфичный nudge (механика, не промпт).
+            inst = None
+            if alive and worktrees_enabled() and card["assignee"] in LOCK_ROLES \
+                    and os.path.isdir(wt_dir(cid)):
+                inst = detect_install_violation(cid)
+                if inst:
+                    log(f"[install-guard] {cid}: запрещённый install в worktree: '{inst[:80]}' — kill")
+                    kill_worker(pid)
+                    alive = False
+                    reason = "INSTALL-VIOLATION: '" + inst[:120] + "'"
             if alive:
                 kill_worker(pid)  # зависший воркер жив — убиваем группу, иначе сирота пишет в репо
+            # Аудит 2026-08-28 (итерация 2): диагностичный nudge — последние
+            # ошибки из лога попадают в комментарий-пинок (regex, 0 LLM).
+            diag = extract_diag(cid)
             rc = c.execute("SELECT COUNT(*) n FROM runs WHERE card_id=?", (cid,)).fetchone()["n"]
             nudges = card["nudged"] or 0
             if rc < card["max_retries"]:
@@ -699,7 +798,7 @@ def iter_cycle(oneshot=False):
                     # Слой E: мягкий пинок — дешёвый перезапуск БЕЗ расхода retry.
                     # Комментарий-пинок воркер прочитает при старте (протокол: начать с чтения карточки).
                     c.execute("UPDATE cards SET status='ready', nudged=nudged+1, heartbeat=NULL WHERE id=?", (cid,))
-                    inject_nudge_comment(c, cid, reason)
+                    inject_nudge_comment(c, cid, reason, diag)
                     ev(c, cid, "nudge", f"{nudges + 1}/{MAX_NUDGES}: {reason}")
                     log(f"[nudge] {cid}: {reason} -> ready (пинок {nudges + 1}, retry не потрачен)")
                 else:
@@ -921,7 +1020,21 @@ def main():
             if not DRY_RUN:
                 wait_and_collect()
             break
-        time.sleep(POLL_SEC)
+        # Аудит 2026-08-28 (итерация 8): адаптивный интервал сна.
+        # running>0 -> 30с (мониторинг heartbeat); ready>0 -> 15с (быстрый старт);
+        # иначе -> 120с (простой). ПАУЗА распознаётся не позже 120с.
+        if ADAPT_POLL:
+            try:
+                cc = con()
+                nr = cc.execute("SELECT COUNT(*) n FROM cards WHERE status='running' AND kind!='epic'").fetchone()["n"]
+                ny = cc.execute("SELECT COUNT(*) n FROM cards WHERE status='ready' AND kind!='epic'").fetchone()["n"]
+                cc.close()
+                sleep_s = ADAPT_ACTIVE_SEC if nr else (ADAPT_READY_SEC if ny else ADAPT_IDLE_SEC)
+            except Exception:
+                sleep_s = POLL_SEC
+        else:
+            sleep_s = POLL_SEC
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":

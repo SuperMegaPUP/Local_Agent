@@ -39,6 +39,15 @@ PROJECT_DIR = os.path.expanduser(os.environ.get("FASTLANE_PROJECT_DIR", "~/goriz
 SEMANTIC_VERIFY = os.environ.get("FASTLANE_SEMANTIC_VERIFY", "0") == "1"
 VLLM_CHAT_URL = os.environ.get("FASTLANE_VLLM_URL", "http://192.168.31.52:8000/v1/chat/completions")
 COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+# ---- Внешний аудит 2026-08-28 (итерации 3, 4) -----------------------------
+# L1.5 (детерминированный, 0 токенов): заявленный коммит обязан быть достижим
+# (из main или из wt-ветки карточки) и непустым (иметь diff). Закрывает класс
+# «пустой/несуществующий-по-сути коммит как фейковый артефакт».
+# Селективный L2: FASTLANE_L2_RETRY_ONLY=1 — семантическая верификация ТОЛЬКО
+# для карточек с retry_count>=1 (пиковый риск конфабуляции после пинка).
+L2_RETRY_ONLY = os.environ.get("FASTLANE_L2_RETRY_ONLY", "0") == "1"
+L2_MAX_TOKENS = int(os.environ.get("FASTLANE_L2_MAX_TOKENS", "200"))
+L2_TIMEOUT = int(os.environ.get("FASTLANE_L2_TIMEOUT", "30"))
 
 
 def extract_claimed_commits(body):
@@ -60,6 +69,42 @@ def verify_commits(repo, hashes):
     return bad
 
 
+def verify_commit_content(repo, hashes, card_id):
+    """Уровень 1.5 (аудит 2026-08-28, итерация 3): детерминированная проверка
+    СОДЕРЖАНИЯ заявленного коммита (0 токенов):
+      1. достижимость: коммит должен быть reachable из main ИЛИ из wt-ветки
+         карточки (git merge-base --is-ancestor). Защита от «коммит из другого
+         мира» (другое репо/grafted история), которого нет ни в main, ни в ветке.
+      2. непустота: у коммита должен быть ненулевой diff (git show --stat).
+         Пустой коммит (= `git commit --allow-empty`) как «фикс бага» — reject.
+    Возвращает список (hash, причина) для плохих; пусто = ок."""
+    problems = []
+    heads = ["main"]
+    # worktree-ветка карточки: wt/<card_id> (может быть уже удалена после мержа —
+    # тогда достаточно достижимости из main).
+    br = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "refs/heads/wt/" + card_id],
+                        capture_output=True, text=True, timeout=10)
+    if br.returncode == 0:
+        heads.append(br.stdout.strip())
+    for h in dict.fromkeys(hashes):
+        reach = False
+        for hd in heads:
+            r = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", h, hd],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                reach = True
+                break
+        if not reach:
+            problems.append((h, "недостижим из main/wt-ветки"))
+            continue
+        st = subprocess.run(["git", "-C", repo, "show", "--stat", "--format=", h],
+                            capture_output=True, text=True, timeout=10)
+        stat = (st.stdout or "").strip()
+        if not stat:
+            problems.append((h, "пустой коммит (нет diff)"))
+    return problems
+
+
 def semantic_verify(card_title, draft, events_tail):
     """Уровень 2: LLM сверяет черновик с реальными событиями. (ok, issues) или None."""
     import json as _json
@@ -77,12 +122,12 @@ def semantic_verify(card_title, draft, events_tail):
     body = _json.dumps({
         "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0, "max_tokens": 400,
+        "temperature": 0, "max_tokens": L2_MAX_TOKENS,
     }).encode()
     req = urllib.request.Request(VLLM_CHAT_URL, data=body,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=L2_TIMEOUT) as resp:
             data = _json.loads(resp.read())
         txt = data["choices"][0]["message"]["content"].strip()
         m = re.search(r"\{.*\}", txt, re.S)
@@ -163,8 +208,21 @@ def _run_once(now, dry):
                 log_line("TRACEGUARD %s :: несуществующие коммиты %s — приёмка отложена"
                          % (cid, ",".join(bad[:5])))
                 continue
+            # Уровень 1.5 (аудит 2026-08-28, итерация 3): содержательность —
+            # достижимость из main/wt-ветки + непустой diff. Детерминированно.
+            probs = verify_commit_content(PROJECT_DIR, claimed, cid)
+            if probs:
+                skipped_trace.append(cid)
+                log_line("TRACEGUARD-L1.5 %s :: %s — приёмка отложена"
+                         % (cid, "; ".join("%s(%s)" % (h, why) for h, why in probs[:3])[:200]))
+                continue
         # Уровень 2 (опционально): семантическая сверка отчёта с журналом.
-        if SEMANTIC_VERIFY:
+        # Аудит 2026-08-28 (итерация 4): FASTLANE_L2_RETRY_ONLY=1 — верифицируем
+        # ТОЛЬКО карточки с retry_count>=1 (пиковый риск конфабуляции после пинка).
+        # Fail-open сохраняется: ошибка верификатора = пропуск, не блокировка.
+        l2_active = SEMANTIC_VERIFY and (
+            (not L2_RETRY_ONLY) or (card["retry_count"] or 0) >= 1)
+        if l2_active:
             events_tail = "\n".join(
                 "[%s] %s %s" % ((parse_ts(e["created_at"]) or now).strftime("%H:%M:%S"),
                                 e["type"], (e["payload"] or "")[:100])

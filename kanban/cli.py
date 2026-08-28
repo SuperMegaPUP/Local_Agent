@@ -188,6 +188,91 @@ def known_roles():
         return set()
 
 
+def cmd_metrics(a):
+    """Внешний аудит 2026-08-28 (итерация 6): метрики эффективности конвейера.
+    Чистый SQL по events/cards/runs — 0 LLM. Показывает, РАБОТАЮТ ЛИ слои:
+    nudge-success, gate-FAIL-rate, среднее время цикла, эскалации, причины смертей."""
+    c = con()
+    FMT = "%Y-%m-%d %H:%M:%S"
+
+    def dt(s):
+        try:
+            return datetime.strptime(s, FMT)
+        except Exception:
+            return None
+
+    total_done = c.execute("SELECT COUNT(*) n FROM cards WHERE status='done' AND kind!='epic'").fetchone()["n"]
+    total_all = c.execute("SELECT COUNT(*) n FROM cards WHERE kind!='epic'").fetchone()["n"]
+
+    # Nudge economics: cards that got nudged and eventually finished vs died.
+    nudged_cards = c.execute("""
+        SELECT DISTINCT e.card_id FROM events e JOIN cards k ON k.id=e.card_id
+        WHERE e.type='nudge'""").fetchall()
+    nu_total = len(nudged_cards)
+    nu_survived = 0
+    for row in nudged_cards:
+        st = c.execute("SELECT status FROM cards WHERE id=?", (row["card_id"],)).fetchone()
+        if st and st["status"] == "done":
+            nu_survived += 1
+
+    # Gate statistics: passed vs failed stamps.
+    gp = c.execute("SELECT COUNT(*) n FROM events WHERE type='gates-passed'").fetchone()["n"]
+    gf = c.execute("SELECT COUNT(*) n FROM events WHERE type='gates-failed'").fetchone()["n"]
+    gate_rate = (gf / (gp + gf) * 100) if (gp + gf) else 0.0
+
+    # Cycle time: created_at -> finished_at for done cards.
+    durations = []
+    for r in c.execute("SELECT created_at, finished_at FROM cards WHERE status='done' AND kind!='epic'"):
+        a_, b_ = dt(r["created_at"]), dt(r["finished_at"])
+        if a_ and b_:
+            durations.append((b_ - a_).total_seconds() / 3600)
+    avg_hours = sum(durations) / len(durations) if durations else 0.0
+
+    # Escalations: created vs resolved(done).
+    esc_created = c.execute("SELECT COUNT(*) n FROM cards WHERE kind='escalation'").fetchone()["n"]
+    esc_done = c.execute("SELECT COUNT(*) n FROM cards WHERE kind='escalation' AND status='done'").fetchone()["n"]
+
+    # Death reasons distribution (from retry/blocked event payloads).
+    reasons = {}
+    for e in c.execute("SELECT payload FROM events WHERE type IN ('retry','blocked')"):
+        p = (e["payload"] or "")[:40]
+        if "LOOP" in p.upper():
+            key = "loop"
+        elif "stuck>" in p:
+            key = "stuck/heartbeat"
+        elif "dead" in p:
+            key = "crash(dead)"
+        else:
+            key = "other:" + p[:20]
+        reasons[key] = reasons.get(key, 0) + 1
+
+    # Retries per card histogram.
+    retried = c.execute("SELECT COUNT(*) n FROM cards WHERE retry_count>0 AND kind!='epic'").fetchone()["n"]
+
+    print("=" * 62)
+    print("METRICS (аудит 2026-08-28, итерация 6) — %s" % now())
+    print("=" * 62)
+    print("Cards: total=%d done=%d retried=%d" % (total_all, total_done, retried))
+    print("-" * 62)
+    print("[NUDGE ECONOMICS]")
+    print("  cards ever nudged: %d" % nu_total)
+    if nu_total:
+        print("  survived to done: %d (%.0f%%)" % (nu_survived, nu_survived / nu_total * 100))
+    print("[GATES]")
+    print("  passed=%d failed=%d  FAIL-rate=%.1f%%" % (gp, gf, gate_rate))
+    print("[THROUGHPUT]")
+    print("  avg cycle time (created->done): %.1fh over %d cards" % (avg_hours, len(durations)))
+    print("[ESCALATIONS]")
+    print("  created=%d resolved=%d" % (esc_created, esc_done))
+    print("[DEATH REASONS (retry+blocked events)]")
+    if reasons:
+        for k, v in sorted(reasons.items(), key=lambda x: -x[1]):
+            print("  %-22s %d" % (k, v))
+    else:
+        print("  (нет)")
+    c.close()
+
+
 def cmd_ask(a):
     """SIMBIOSIS W3 (слой J): консультация у роли. kind=consult, без декомпозии.
     Воркер отвечает комментарием ANSWER: + move review; fastlane принимает
@@ -232,10 +317,11 @@ def main():
     sp = sub.add_parser("mem"); sp.add_argument("--kind", default="memory"); sp.add_argument("--content", required=True); sp.add_argument("--project"); sp.add_argument("--tags")
     sp = sub.add_parser("recall"); sp.add_argument("q"); sp.add_argument("--kind")
     sp = sub.add_parser("ask"); sp.add_argument("role"); sp.add_argument("question"); sp.add_argument("--parent")
+    sub.add_parser("metrics")
     a = ap.parse_args()
     {"init": cmd_init, "create": cmd_create, "list": cmd_list, "show": cmd_show,
      "move": cmd_move, "comment": cmd_comment, "mem": cmd_mem, "recall": cmd_recall,
-     "ask": cmd_ask}[a.cmd](a)
+     "ask": cmd_ask, "metrics": cmd_metrics}[a.cmd](a)
 
 
 if __name__ == "__main__":
