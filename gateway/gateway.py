@@ -269,6 +269,20 @@ def detect_install_violation(cid):
     return m.group(0).strip()[:200] if m else None
 
 
+def adaptive_sleep_sec(nr_running, nr_ready):
+    """Аудит 2026-08-28 (итерация 8): выбор интервала сна главного цикла.
+    Вынесено в функцию для тестируемости (условие одобрения Wave 2:
+    каждый staged-путь покрыт тестом). running>0 -> 30с (heartbeat-контроль);
+    ready>0 -> 15с (быстрый старт); иначе -> 120с (простой)."""
+    if not ADAPT_POLL:
+        return POLL_SEC
+    if nr_running:
+        return ADAPT_ACTIVE_SEC
+    if nr_ready:
+        return ADAPT_READY_SEC
+    return ADAPT_IDLE_SEC
+
+
 def inject_nudge_comment(c, cid, reason, diag=""):
     """Слой E: комментарий-пинок на карточке — воркер прочитает его при перезапуске
     (протокол требует начинать с чтения карточки).
@@ -1032,15 +1046,15 @@ def main():
                 wait_and_collect()
             break
         # Аудит 2026-08-28 (итерация 8): адаптивный интервал сна.
-        # running>0 -> 30с (мониторинг heartbeat); ready>0 -> 15с (быстрый старт);
-        # иначе -> 120с (простой). ПАУЗА распознаётся не позже 120с.
+        # Выбор вынесен в adaptive_sleep_sec() (тестируемое ядро); здесь —
+        # сбор входных данных (running/ready) с fallback на POLL_SEC.
         if ADAPT_POLL:
             try:
                 cc = con()
                 nr = cc.execute("SELECT COUNT(*) n FROM cards WHERE status='running' AND kind!='epic'").fetchone()["n"]
                 ny = cc.execute("SELECT COUNT(*) n FROM cards WHERE status='ready' AND kind!='epic'").fetchone()["n"]
                 cc.close()
-                sleep_s = ADAPT_ACTIVE_SEC if nr else (ADAPT_READY_SEC if ny else ADAPT_IDLE_SEC)
+                sleep_s = adaptive_sleep_sec(nr, ny)
             except Exception:
                 sleep_s = POLL_SEC
         else:

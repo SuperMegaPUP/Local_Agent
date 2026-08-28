@@ -187,6 +187,20 @@ check("nudge-install-warning", rows and "ЗАПРЕЩЕНА" in rows[0]["body"],
 check("adapt consts", gw.ADAPT_POLL is True and gw.ADAPT_ACTIVE_SEC == 30
       and gw.ADAPT_READY_SEC == 15 and gw.ADAPT_IDLE_SEC == 120,
       "poll=%s a=%s r=%s i=%s" % (gw.ADAPT_POLL, gw.ADAPT_ACTIVE_SEC, gw.ADAPT_READY_SEC, gw.ADAPT_IDLE_SEC))
+# Матрица выбора интервала (условие одобрения Wave 2: каждый staged-путь покрыт)
+check("adapt-running", gw.adaptive_sleep_sec(1, 0) == 30, str(gw.adaptive_sleep_sec(1, 0)))
+check("adapt-running-beats-ready", gw.adaptive_sleep_sec(2, 5) == 30, str(gw.adaptive_sleep_sec(2, 5)))
+check("adapt-ready", gw.adaptive_sleep_sec(0, 3) == 15, str(gw.adaptive_sleep_sec(0, 3)))
+check("adapt-idle", gw.adaptive_sleep_sec(0, 0) == 120, str(gw.adaptive_sleep_sec(0, 0)))
+_old_adapt = gw.ADAPT_POLL
+gw.ADAPT_POLL = False
+check("adapt-disabled-falls-back", gw.adaptive_sleep_sec(1, 1) == gw.POLL_SEC,
+      str(gw.adaptive_sleep_sec(1, 1)))
+gw.ADAPT_POLL = _old_adapt
+# Основной цикл использует функцию (а не инлайн-тренарный оператор)
+_src_main = open(STAGE + "/gateway.py").read()
+check("main-loop-calls-adaptive-fn",
+      "sleep_s = adaptive_sleep_sec(nr, ny)" in _src_main, "inline ternary остался в main()?")
 
 # ================= cli: metrics (итерация 6) =================
 cli_db = TD + "/cli_board.sqlite3"
@@ -299,6 +313,38 @@ check("metrics-overhead-total", "180.0s" in out3, out3[out3.find("[OVERHEAD"):][
 check("metrics-overhead-percard", "per-card overhead: 1.00 min" in out3, out3[out3.find("per-card"):][:80])
 # 1.0 min / 90 min avg cycle = 1.11% (denominator = 3 done incl. escalation)
 check("metrics-overhead-pct", "(1.11% of avg cycle)" in out3, out3[out3.find("per-card"):][:80])
+
+# ================= статическое покрытие staged-путей (условие одобрения Wave 2) =================
+# Каждый staged-путь обязан иметь проверку: поведенческую (выше) или статическую (ниже).
+SRC_GW = open(STAGE + "/gateway.py").read()
+# Q2: tsc --incremental в _capture_current_gate_states
+check("static-tsc-incremental",
+      '--incremental' in SRC_GW and '.tsbuildinfo' in SRC_GW
+      and 'incr_args' in SRC_GW, "tsc --incremental не найден в _capture_current_gate_states")
+# Q5: честные тайминги гейтов (до: now(), now() — 0.0s)
+check("static-gate-timings",
+      "_gt0 = now()" in SRC_GW and "report[:4000], _gt0, now()" in SRC_GW,
+      "тайминги гейтов не пишутся (now()/now() вернулся?)")
+# Итерация 7: install-guard — вар. B (kill + специфичный nudge). node_modules —
+# symlink на центральный, install одного воркера ломает всех → kill оправдан.
+# Сидит ВНУТРИ блока `if not alive or stuck:`, загейчен на `alive`: срабатывает
+# только для живого, но ЗАВИСШЕГО воркера (npm install молчит -> heartbeat протух
+# -> stuck -> guard находит install в логе и заменяет «stuck>20min» на
+# «INSTALL-VIOLATION: ...» — целевой nudge вместо расплывчатого).
+_i_deadblock = SRC_GW.find("if not alive or stuck:")
+_i_guard = SRC_GW.find("detect_install_violation(", _i_deadblock)
+check("static-install-guard-in-deathblock",
+      _i_deadblock > 0 and _i_guard > _i_deadblock,
+      "install-guard вне death/stuck-блока (death=%d guard=%d)" % (_i_deadblock, _i_guard))
+check("static-install-guard-alive-gated",
+      "if alive and worktrees_enabled()" in SRC_GW,
+      "install-guard не загейчен на alive (сработает на мёртвом воркере)")
+check("static-install-guard-scoped",
+      'card["assignee"] in LOCK_ROLES' in SRC_GW and "os.path.isdir(wt_dir(cid))" in SRC_GW,
+      "scope install-guard (lock-role + worktree-dir) потерян")
+# Итерация 2: diag передаётся в inject_nudge_comment из места вызова
+check("static-diag-passthrough",
+      "inject_nudge_comment(c, cid, reason, diag)" in SRC_GW, "diag не передаётся в nudge-comment")
 
 # ================= ИТОГ =================
 print("\n" + "=" * 50)
